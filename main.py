@@ -11,6 +11,8 @@ ROLE_MAP = {
     'Diamante': "Diamante 💎"
 }
 REGISTRATION_LINK = "https://aluno.operebem.com.br"
+# Cor azul "Blurple" do Discord
+EMBED_COLOR = 0x5865F2 
 
 # --- MODAL: O FORMULÁRIO POP-UP PARA O CÓDIGO ---
 class ValidationModal(ui.Modal, title="Validação de Acesso"):
@@ -18,7 +20,7 @@ class ValidationModal(ui.Modal, title="Validação de Acesso"):
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
-        
+        # ... (Toda a lógica de validação do banco de dados permanece a mesma) ...
         token = self.token_input.value.strip()
         connection = create_db_connection()
 
@@ -72,7 +74,7 @@ class ValidationModal(ui.Modal, title="Validação de Acesso"):
             cursor.close()
             connection.close()
 
-# --- VIEW: A CAIXA COM OS BOTÕES PERSISTENTES ---
+# --- VIEW: A CAIXA COM OS BOTÕES DE VALIDAÇÃO ---
 class ValidationView(ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -117,17 +119,47 @@ async def on_ready():
     print(f'✅ Bot {client.user} está online e pronto!')
     print('Comandos sincronizados.')
 
-# --- COMANDO DE SETUP (SÓ PARA ADMINS) ---
+# --- COMANDO DE SETUP DO PAINEL DE VALIDAÇÃO ---
 @tree.command(name="enviar_painel_validacao", description="Envia o painel de validação fixo neste canal.")
 @app_commands.default_permissions(administrator=True)
 async def send_validation_panel(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🔑 Área Exclusiva para Alunos TradingClass",
         description="Para acessar os canais e benefícios exclusivos, é necessário validar seu cadastro.\n\nClique no botão abaixo para inserir seu TOKEN único (disponível na área do aluno) e liberar automaticamente seu cargo:",
-        color=discord.Color.gold()
+        color=EMBED_COLOR # <-- COR ALTERADA AQUI
     )
     await interaction.channel.send(embed=embed, view=ValidationView())
     await interaction.response.send_message("Painel de validação enviado!", ephemeral=True)
+
+# --- NOVO COMANDO DE BOAS-VINDAS ---
+@tree.command(name="enviar_boas_vindas", description="Envia a mensagem de boas-vindas neste canal.")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(canal_validacao="O canal para onde o botão de validação deve levar.")
+async def send_welcome_message(interaction: discord.Interaction, canal_validacao: discord.TextChannel):
+    welcome_text = (
+        ":wave: **Bem-vindo à TradingClass!**\n\n"
+        "Este é um espaço exclusivo da OpereBem para quem decidiu evoluir de verdade no mercado.\n"
+        "Aqui dentro você terá acesso a:\n\n"
+        ":books: Materiais e apostilas para estudo\n"
+        ":movie_camera: Aulas e treinamentos organizados por módulos\n"
+        ":bar_chart: Discussões e análises de mercado em tempo real\n"
+        ":busts_in_silhouette: Conexão com professores, traders e outros alunos\n\n"
+        f":arrow_right: Para liberar seu acesso, vá até {canal_validacao.mention} e siga as instruções.\n\n"
+        "Seu próximo passo como Trader começa agora. :rocket:"
+    )
+
+    embed = discord.Embed(
+        description=welcome_text,
+        color=EMBED_COLOR
+    )
+
+    # Criando os botões para a mensagem de boas-vindas
+    view = ui.View()
+    view.add_item(ui.Button(label="Ir para Validação", style=discord.ButtonStyle.link, url=canal_validacao.jump_url))
+    view.add_item(ui.Button(label="Ainda não sou aluno", style=discord.ButtonStyle.link, url=REGISTRATION_LINK))
+
+    await interaction.channel.send(embed=embed, view=view)
+    await interaction.response.send_message("Mensagem de boas-vindas enviada!", ephemeral=True)
 
 # --- RODAR O BOT ---
 bot_token = os.environ.get('DISCORD_TOKEN')
