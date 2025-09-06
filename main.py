@@ -1,16 +1,92 @@
 import discord
-from discord import app_commands
+from discord import app_commands, ui
 import os
 import mysql.connector
 from mysql.connector import Error
 
 # --- CONFIGURAÇÃO ---
-# Dicionário mapeando o tier do banco de dados para os nomes EXATOS dos cargos
 ROLE_MAP = {
     'Prata': "Prata 🥈",
     'Ouro': "Ouro 🥇",
     'Diamante': "Diamante 💎"
 }
+REGISTRATION_LINK = "https://aluno.operebem.com.br"
+
+# --- MODAL: O FORMULÁRIO POP-UP PARA O CÓDIGO ---
+class ValidationModal(ui.Modal, title="Validação de Acesso"):
+    token_input = ui.TextInput(label="Seu Token de Validação", placeholder="Cole aqui o token que você pegou no site...", style=discord.TextStyle.short)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        
+        token = self.token_input.value.strip()
+        connection = create_db_connection()
+
+        if not connection:
+            await interaction.followup.send("❌ Ocorreu um erro interno. A conexão com o banco de dados falhou.", ephemeral=True)
+            return
+
+        cursor = connection.cursor(dictionary=True)
+        try:
+            cursor.execute("SELECT * FROM discord_validation WHERE validation_code = %s", (token,))
+            record = cursor.fetchone()
+
+            if not record:
+                await interaction.followup.send("❌ Token inválido. Verifique o código e tente novamente.", ephemeral=True)
+                return
+
+            if record['is_validated']:
+                await interaction.followup.send("⚠️ Este token já foi utilizado.", ephemeral=True)
+                return
+
+            target_tier = record['subscription_tier']
+            target_role_name = ROLE_MAP.get(target_tier)
+
+            if not target_role_name:
+                await interaction.followup.send("❌ Erro: Seu plano não corresponde a um cargo válido. Contate o suporte.", ephemeral=True)
+                return
+
+            guild = interaction.guild
+            member = interaction.user
+            role_to_add = discord.utils.get(guild.roles, name=target_role_name)
+
+            if not role_to_add:
+                await interaction.followup.send(f"❌ Erro crítico: O cargo '{target_role_name}' não foi encontrado. Contate um administrador.", ephemeral=True)
+                return
+
+            roles_to_remove = [role for role in member.roles if role.name in ROLE_MAP.values() and role.name != target_role_name]
+            if roles_to_remove:
+                await member.remove_roles(*roles_to_remove, reason="Upgrade de plano de assinatura")
+
+            await member.add_roles(role_to_add, reason="Validação de assinatura via site")
+
+            cursor.execute("UPDATE discord_validation SET is_validated = TRUE, discord_user_id = %s WHERE id = %s", (str(member.id), record['id']))
+            connection.commit()
+
+            await interaction.followup.send(f"✅ Validação concluída! Você recebeu o cargo **{target_role_name}**. Bem-vindo(a)!", ephemeral=True)
+
+        except Error as e:
+            print(f"Erro de banco de dados na validação: {e}")
+            await interaction.followup.send("❌ Ocorreu um erro ao processar sua validação. Tente novamente.", ephemeral=True)
+        finally:
+            cursor.close()
+            connection.close()
+
+# --- VIEW: A CAIXA COM OS BOTÕES PERSISTENTES ---
+class ValidationView(ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @ui.button(label="✅ Validar", style=discord.ButtonStyle.green, custom_id="persistent_validation_button")
+    async def validate_button(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_modal(ValidationModal())
+
+    @ui.button(label="📩 Ainda não sou aluno", style=discord.ButtonStyle.blurple, custom_id="persistent_register_button")
+    async def register_button(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_message(
+            f"Para se tornar um aluno e obter seu token de acesso, [clique aqui para se cadastrar]({REGISTRATION_LINK}).",
+            ephemeral=True
+        )
 
 # --- CONEXÃO COM O BOT ---
 intents = discord.Intents.default()
@@ -33,78 +109,25 @@ def create_db_connection():
         print(f"Erro ao conectar ao MySQL: {e}")
         return None
 
-# --- EVENTO DE BOT PRONTO ---
+# --- EVENTO DE BOT PRONTO (LÓGICA DE PERSISTÊNCIA) ---
 @client.event
 async def on_ready():
+    client.add_view(ValidationView())
     await tree.sync()
     print(f'✅ Bot {client.user} está online e pronto!')
     print('Comandos sincronizados.')
 
-# --- COMANDO DE VALIDAÇÃO ---
-@tree.command(name="validar", description="Valide sua assinatura e receba seu cargo exclusivo.")
-@app_commands.describe(codigo="Seu código de validação gerado em nosso site.")
-async def validar(interaction: discord.Interaction, codigo: str):
-    await interaction.response.defer(ephemeral=True)
-
-    connection = create_db_connection()
-    if not connection:
-        await interaction.followup.send("❌ Ocorreu um erro interno. A conexão com o banco de dados falhou.", ephemeral=True)
-        return
-
-    cursor = connection.cursor(dictionary=True)
-    
-    try:
-        cursor.execute("SELECT * FROM discord_validation WHERE validation_code = %s", (codigo,))
-        record = cursor.fetchone()
-
-        if not record:
-            await interaction.followup.send("❌ Código de validação inválido. Verifique o código e tente novamente.", ephemeral=True)
-            return
-
-        if record['is_validated']:
-            await interaction.followup.send("⚠️ Este código já foi utilizado.", ephemeral=True)
-            return
-            
-        target_tier = record['subscription_tier']
-        target_role_name = ROLE_MAP.get(target_tier)
-        
-        if not target_role_name:
-            await interaction.followup.send("❌ Erro: O seu plano não corresponde a um cargo válido. Contate o suporte.", ephemeral=True)
-            return
-
-        guild = interaction.guild
-        member = interaction.user
-        
-        role_to_add = discord.utils.get(guild.roles, name=target_role_name)
-        if not role_to_add:
-            await interaction.followup.send(f"❌ Erro crítico: O cargo '{target_role_name}' não foi encontrado. Contate um administrador.", ephemeral=True)
-            return
-            
-        roles_to_remove = []
-        all_tier_roles = list(ROLE_MAP.values())
-        for user_role in member.roles:
-            if user_role.name in all_tier_roles and user_role.name != target_role_name:
-                roles_to_remove.append(user_role)
-        
-        if roles_to_remove:
-            await member.remove_roles(*roles_to_remove, reason="Upgrade de plano de assinatura")
-
-        await member.add_roles(role_to_add, reason="Validação de assinatura via site")
-
-        cursor.execute(
-            "UPDATE discord_validation SET is_validated = TRUE, discord_user_id = %s WHERE id = %s", 
-            (str(member.id), record['id'])
-        )
-        connection.commit()
-
-        await interaction.followup.send(f"✅ Validação concluída! Você recebeu o cargo **{target_role_name}**. Bem-vindo(a)!", ephemeral=True)
-
-    except Error as e:
-        print(f"Erro de banco de dados durante a validação: {e}")
-        await interaction.followup.send("❌ Ocorreu um erro ao processar sua validação. Tente novamente.", ephemeral=True)
-    finally:
-        cursor.close()
-        connection.close()
+# --- COMANDO DE SETUP (SÓ PARA ADMINS) ---
+@tree.command(name="enviar_painel_validacao", description="Envia o painel de validação fixo neste canal.")
+@app_commands.default_permissions(administrator=True)
+async def send_validation_panel(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🔑 Área Exclusiva para Alunos TradingClass",
+        description="Para acessar os canais e benefícios exclusivos, é necessário validar seu cadastro.\n\nClique no botão abaixo para inserir seu TOKEN único (disponível na área do aluno) e liberar automaticamente seu cargo:",
+        color=discord.Color.gold()
+    )
+    await interaction.channel.send(embed=embed, view=ValidationView())
+    await interaction.response.send_message("Painel de validação enviado!", ephemeral=True)
 
 # --- RODAR O BOT ---
 bot_token = os.environ.get('DISCORD_TOKEN')
