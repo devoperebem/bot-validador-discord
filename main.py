@@ -58,6 +58,34 @@ def validate_environment():
     print("✅ Todas as variáveis de ambiente estão configuradas!")
     return True
 
+def load_role_configs():
+    """Carregar configurações de cargos do banco de dados"""
+    global ROLE_ALUNO_ID, ROLE_MENTORADO_ID
+    
+    try:
+        conn = get_db_connection()
+        if conn:
+            cursor = conn.cursor()
+            
+            # Carregar ID do cargo Aluno
+            cursor.execute("SELECT config_value FROM discord_config WHERE config_key = 'role_aluno_id'")
+            result = cursor.fetchone()
+            if result and result[0] and result[0] != '0':
+                ROLE_ALUNO_ID = int(result[0])
+            
+            # Carregar ID do cargo Mentorado
+            cursor.execute("SELECT config_value FROM discord_config WHERE config_key = 'role_mentorado_id'")
+            result = cursor.fetchone()
+            if result and result[0] and result[0] != '0':
+                ROLE_MENTORADO_ID = int(result[0])
+            
+            conn.close()
+            print(f"✅ Configurações carregadas - Aluno: {ROLE_ALUNO_ID}, Mentorado: {ROLE_MENTORADO_ID}")
+        else:
+            print("⚠️ Não foi possível carregar configurações do banco")
+    except Exception as e:
+        print(f"⚠️ Erro ao carregar configurações: {e}")
+
 def get_db_connection():
     """Conectar ao banco de dados"""
     try:
@@ -292,18 +320,21 @@ class ValidationModal(ui.Modal, title="Validação de Acesso"):
                 return
 
             tier = user_data.get('subscription_tier')
-            role_id_to_add = ROLE_ALUNO_ID if tier == 'Aluno' else ROLE_MENTORADO_ID
-
-            if not role_id_to_add:
-                await interaction.followup.send("❌ Erro: Cargo não configurado no bot. Contate um administrador.", ephemeral=True)
+            
+            # Verificar se os cargos estão configurados
+            if not ROLE_ALUNO_ID or not ROLE_MENTORADO_ID:
+                await interaction.followup.send("❌ Erro: Cargos não configurados no bot. Um administrador deve usar `/configurar_cargos` primeiro.", ephemeral=True)
                 return
+            
+            role_id_to_add = ROLE_ALUNO_ID if tier == 'Aluno' else ROLE_MENTORADO_ID
+            role_name = 'Aluno' if tier == 'Aluno' else 'Mentorado'
             
             guild = interaction.guild
             member = interaction.user
             role_to_add = guild.get_role(role_id_to_add)
 
             if not role_to_add:
-                await interaction.followup.send(f"❌ Erro crítico: O cargo para '{tier}' não foi encontrado. Contate um administrador.", ephemeral=True)
+                await interaction.followup.send(f"❌ Erro: O cargo '{role_name}' não foi encontrado no servidor. Verifique se o cargo existe e se o bot tem permissões.", ephemeral=True)
                 return
             
             # Remover outros cargos de assinatura
@@ -360,11 +391,17 @@ client = MyClient(intents=intents)
 async def check_expired_subscriptions():
     print("Iniciando verificação de assinaturas expiradas...")
     try:
+        # Verificar se os cargos estão configurados
+        if not ROLE_ALUNO_ID or not ROLE_MENTORADO_ID:
+            print("⚠️ Cargos não configurados, pulando verificação de expirados")
+            return
+            
         expired_users = get_expired_users()
         print(f"Encontrados {len(expired_users)} usuários expirados.")
         
         guild = client.get_guild(GUILD_ID)
         if not guild:
+            print("❌ Guild não encontrada")
             return
         
         for user in expired_users:
@@ -373,21 +410,37 @@ async def check_expired_subscriptions():
             if not discord_id or not tier:
                 continue
 
-            member = guild.get_member(int(discord_id))
-            role_id_to_remove = ROLE_ALUNO_ID if tier == 'Aluno' else ROLE_MENTORADO_ID
-            role_to_remove = guild.get_role(role_id_to_remove)
-            
-            if member and role_to_remove and role_to_remove in member.roles:
-                await member.remove_roles(role_to_remove, reason="Assinatura expirada")
+            try:
+                member = guild.get_member(int(discord_id))
+                if not member:
+                    print(f"⚠️ Membro {discord_id} não encontrado no servidor")
+                    continue
+                    
+                role_id_to_remove = ROLE_ALUNO_ID if tier == 'Aluno' else ROLE_MENTORADO_ID
+                role_to_remove = guild.get_role(role_id_to_remove)
                 
-                # Marcar como removido no banco
-                mark_role_removed(discord_id, str(client.user.id))
+                if not role_to_remove:
+                    print(f"⚠️ Cargo {tier} não encontrado")
+                    continue
+                
+                if role_to_remove in member.roles:
+                    await member.remove_roles(role_to_remove, reason="Assinatura expirada")
+                    
+                    # Marcar como removido no banco
+                    if mark_role_removed(discord_id, str(client.user.id)):
+                        print(f"✅ Cargo '{role_to_remove.name}' removido de {member.name}")
+                    else:
+                        print(f"⚠️ Cargo removido de {member.name}, mas erro ao atualizar banco")
+                    
+                    try:
+                        await member.send(f"Olá! Notamos que sua assinatura {tier} expirou. Seu cargo foi removido. Para renovar, visite: {REGISTRATION_LINK}")
+                    except discord.Forbidden:
+                        print(f"Não foi possível enviar DM para {member.name}")
+                else:
+                    print(f"ℹ️ {member.name} não possui o cargo {tier}")
 
-                print(f"Cargo '{role_to_remove.name}' removido de {member.name}.")
-                try:
-                    await member.send(f"Olá! Notamos que sua assinatura {tier} expirou. Seu cargo foi removido. Para renovar, visite: {REGISTRATION_LINK}")
-                except discord.Forbidden:
-                    print(f"Não foi possível enviar DM para {member.name}.")
+            except Exception as e:
+                print(f"Erro ao processar usuário {discord_id}: {e}")
 
     except Exception as e:
         print(f"Erro na verificação de expirados: {e}")
@@ -396,9 +449,8 @@ async def check_expired_subscriptions():
 async def on_ready():
     global ROLE_ALUNO_ID, ROLE_MENTORADO_ID
     
-    # Carregar IDs dos cargos (você pode configurar via variáveis de ambiente)
-    ROLE_ALUNO_ID = int(os.environ.get('ROLE_ALUNO_ID', 0)) or None
-    ROLE_MENTORADO_ID = int(os.environ.get('ROLE_MENTORADO_ID', 0)) or None
+    # Carregar configurações do banco de dados
+    load_role_configs()
     
     client.add_view(ValidationView())
     if not check_expired_subscriptions.is_running():
@@ -407,6 +459,9 @@ async def on_ready():
     print(f'✅ Bot {client.user} está online e pronto!')
     print(f'Cargo Aluno ID: {ROLE_ALUNO_ID}')
     print(f'Cargo Mentorado ID: {ROLE_MENTORADO_ID}')
+    
+    if not ROLE_ALUNO_ID or not ROLE_MENTORADO_ID:
+        print("⚠️ Cargos não configurados! Use /configurar_cargos para configurar.")
 
 # Comandos administrativos
 @client.tree.command(name="status", description="Verifica o status do sistema.")
@@ -442,8 +497,21 @@ async def status(interaction: discord.Interaction):
     except Exception as e:
         embed.add_field(name="Conexão com Banco", value=f"❌ Erro: {e}", inline=False)
 
-    embed.add_field(name="ID Cargo Aluno", value=f"`{ROLE_ALUNO_ID}`" if ROLE_ALUNO_ID else "Não configurado", inline=False)
-    embed.add_field(name="ID Cargo Mentorado", value=f"`{ROLE_MENTORADO_ID}`" if ROLE_MENTORADO_ID else "Não configurado", inline=False)
+    embed.add_field(name="ID Cargo Aluno", value=f"`{ROLE_ALUNO_ID}`" if ROLE_ALUNO_ID else "❌ Não configurado", inline=True)
+    embed.add_field(name="ID Cargo Mentorado", value=f"`{ROLE_MENTORADO_ID}`" if ROLE_MENTORADO_ID else "❌ Não configurado", inline=True)
+    
+    # Status dos cargos no Discord
+    guild = interaction.guild
+    if ROLE_ALUNO_ID:
+        role_aluno = guild.get_role(ROLE_ALUNO_ID)
+        embed.add_field(name="Cargo Aluno", value=f"{role_aluno.mention if role_aluno else '❌ Não encontrado'}", inline=True)
+    
+    if ROLE_MENTORADO_ID:
+        role_mentorado = guild.get_role(ROLE_MENTORADO_ID)
+        embed.add_field(name="Cargo Mentorado", value=f"{role_mentorado.mention if role_mentorado else '❌ Não encontrado'}", inline=True)
+    
+    # Status da verificação automática
+    embed.add_field(name="Verificação Automática", value="✅ Ativa" if check_expired_subscriptions.is_running() else "❌ Inativa", inline=True)
     
     await interaction.followup.send(embed=embed)
 
@@ -457,7 +525,54 @@ async def configure_roles(interaction: discord.Interaction, aluno: discord.Role,
     ROLE_ALUNO_ID = aluno.id
     ROLE_MENTORADO_ID = mentorado.id
 
-    await interaction.followup.send("✅ IDs dos cargos configurados com sucesso!")
+    # Salvar configuração no banco de dados
+    try:
+        conn = get_db_connection()
+        if conn:
+            cursor = conn.cursor()
+            
+            # Atualizar ou inserir configurações
+            cursor.execute("""
+                INSERT INTO discord_config (config_key, config_value, updated_at) 
+                VALUES ('role_aluno_id', %s, NOW())
+                ON DUPLICATE KEY UPDATE config_value = %s, updated_at = NOW()
+            """, (str(aluno.id), str(aluno.id)))
+            
+            cursor.execute("""
+                INSERT INTO discord_config (config_key, config_value, updated_at) 
+                VALUES ('role_mentorado_id', %s, NOW())
+                ON DUPLICATE KEY UPDATE config_value = %s, updated_at = NOW()
+            """, (str(mentorado.id), str(mentorado.id)))
+            
+            conn.commit()
+            conn.close()
+            
+            embed = discord.Embed(
+                title="✅ Cargos Configurados com Sucesso!",
+                description=f"**Cargo Aluno:** {aluno.mention} (ID: `{aluno.id}`)\n**Cargo Mentorado:** {mentorado.mention} (ID: `{mentorado.id}`)",
+                color=0x00ff00
+            )
+            await interaction.followup.send(embed=embed)
+        else:
+            await interaction.followup.send("❌ Erro ao conectar com o banco de dados.")
+    except Exception as e:
+        print(f"Erro ao configurar cargos: {e}")
+        await interaction.followup.send(f"❌ Erro ao salvar configuração: {e}")
+
+@client.tree.command(name="recarregar_configuracoes", description="Recarrega as configurações de cargos do banco de dados.")
+@app_commands.default_permissions(administrator=True)
+async def reload_configs(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    
+    global ROLE_ALUNO_ID, ROLE_MENTORADO_ID
+    load_role_configs()
+    
+    embed = discord.Embed(
+        title="🔄 Configurações Recarregadas",
+        description=f"**Cargo Aluno:** {f'<@&{ROLE_ALUNO_ID}>' if ROLE_ALUNO_ID else 'Não configurado'}\n**Cargo Mentorado:** {f'<@&{ROLE_MENTORADO_ID}>' if ROLE_MENTORADO_ID else 'Não configurado'}",
+        color=EMBED_COLOR
+    )
+    await interaction.followup.send(embed=embed)
 
 @client.tree.command(name="enviar_painel_validacao", description="Envia o painel de validação fixo neste canal.")
 @app_commands.default_permissions(administrator=True)
