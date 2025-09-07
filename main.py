@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Bot Discord com Acesso Direto ao Banco - Trading Class
-Versão alternativa que acessa o banco diretamente
+Versão otimizada para Railway com suas credenciais
 """
 
 import discord
@@ -13,16 +13,16 @@ from datetime import datetime, timedelta
 import hashlib
 import secrets
 
-# Configuração do banco
+# Configuração do banco (usando variáveis de ambiente do Railway)
 DB_CONFIG = {
-    'host': os.environ.get('DB_HOST', 'localhost'),
-    'user': os.environ.get('DB_USER', 'u757800983_tradingclass'),
-    'password': os.environ.get('DB_PASSWORD', 'sua_senha_aqui'),
-    'database': os.environ.get('DB_NAME', 'u757800983_tradingclass'),
+    'host': os.environ.get('DB_HOST'),
+    'user': os.environ.get('DB_USER'),
+    'password': os.environ.get('DB_PASSWORD'),
+    'database': os.environ.get('DB_NAME'),
     'port': int(os.environ.get('DB_PORT', 3306))
 }
 
-# Configuração do bot
+# Configuração do bot (usando variáveis de ambiente do Railway)
 DISCORD_TOKEN = os.environ.get('DISCORD_TOKEN')
 GUILD_ID = int(os.environ.get('GUILD_ID'))
 ROLE_ALUNO_ID = None
@@ -30,6 +30,33 @@ ROLE_MENTORADO_ID = None
 
 REGISTRATION_LINK = "https://aluno.operebem.com.br"
 EMBED_COLOR = 0x5865F2
+
+# Validar variáveis de ambiente obrigatórias
+def validate_environment():
+    """Validar se todas as variáveis de ambiente necessárias estão configuradas"""
+    required_vars = [
+        'DISCORD_TOKEN',
+        'GUILD_ID', 
+        'DB_HOST',
+        'DB_USER',
+        'DB_PASSWORD',
+        'DB_NAME'
+    ]
+    
+    missing_vars = []
+    for var in required_vars:
+        if not os.environ.get(var):
+            missing_vars.append(var)
+    
+    if missing_vars:
+        print(f"❌ Erro: Variáveis de ambiente obrigatórias não encontradas: {', '.join(missing_vars)}")
+        print("Configure as seguintes variáveis no Railway:")
+        for var in missing_vars:
+            print(f"  - {var}")
+        return False
+    
+    print("✅ Todas as variáveis de ambiente estão configuradas!")
+    return True
 
 def get_db_connection():
     """Conectar ao banco de dados"""
@@ -439,9 +466,78 @@ async def send_validation_panel(interaction: discord.Interaction):
     await interaction.channel.send(embed=embed, view=ValidationView())
     await interaction.response.send_message("Painel de validação enviado!", ephemeral=True)
 
+@client.tree.command(name="enviar_boas_vindas", description="Envia a mensagem de boas-vindas neste canal.")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(canal_validacao="O canal para onde o botão de validação deve levar.")
+async def send_welcome_message(interaction: discord.Interaction, canal_validacao: discord.TextChannel):
+    welcome_text = (
+        "💎 **COMUNIDADE TRADINGCLASS**\n\n"
+        "Este é um espaço exclusivo da OpereBem para quem decidiu evoluir de verdade no mercado.\n"
+        "Aqui dentro você terá acesso a:\n\n"
+        ":books: Materiais e apostilas para estudo\n"
+        ":movie_camera: Aulas e treinamentos organizados por módulos\n"
+        ":bar_chart: Discussões e análises de mercado em tempo real\n"
+        ":busts_in_silhouette: Conexão com professores, traders e outros alunos\n\n"
+        f":arrow_right: Para liberar seu acesso, vá até {canal_validacao.mention} e siga as instruções.\n\n"
+        "Seu próximo passo como Trader começa agora. :rocket:"
+    )
+    embed = discord.Embed(description=welcome_text, color=EMBED_COLOR)
+    view = ui.View()
+    view.add_item(ui.Button(label="Ir para Validação", style=discord.ButtonStyle.link, url=canal_validacao.jump_url))
+    view.add_item(ui.Button(label="Ainda não sou aluno", style=discord.ButtonStyle.link, url=REGISTRATION_LINK))
+    await interaction.channel.send(embed=embed, view=view)
+    await interaction.response.send_message("Mensagem de boas-vindas enviada!", ephemeral=True)
+
+@client.tree.command(name="regras", description="Envia a mensagem com as regras da comunidade neste canal.")
+@app_commands.default_permissions(administrator=True)
+async def send_rules(interaction: discord.Interaction):
+    rules_text = (
+        "1️⃣ **Respeito em primeiro lugar**\n"
+        "Trate todos com cordialidade. Não será tolerado preconceito, ataques pessoais, xingamentos ou qualquer forma de discriminação.\n\n"
+        "2️⃣ **Sem spam**\n"
+        "Evite flood de mensagens, áudios ou imagens desnecessárias. Links externos só com autorização da moderação.\n\n"
+        "3️⃣ **Foco no aprendizado**\n"
+        "Essa comunidade é sobre trading, mercado financeiro e desenvolvimento. Mantenha os tópicos relevantes dentro de cada canal.\n\n"
+        "4️⃣ **Nada de calls ou sinais de trade**\n"
+        "O objetivo aqui é educacional. Não compartilhe calls de compra/venda ou promessas de ganhos fáceis.\n\n"
+        "5️⃣ **Ambiente saudável**\n"
+        "Não poste conteúdos ofensivos, violentos, políticos ou de cunho sexual.\n\n"
+        "6️⃣ **Ajuda mútua e colaboração**\n"
+        "Compartilhe conhecimento, tire dúvidas, incentive a evolução dos colegas. A comunidade cresce junto.\n\n"
+        "7️⃣ **Divulgação de terceiros**\n"
+        "Proibido divulgar cursos, canais ou serviços externos sem autorização da equipe.\n\n"
+        "8️⃣ **Confidencialidade**\n"
+        "Respeite o conteúdo exclusivo da TradingClass. Não compartilhe materiais pagos fora do servidor.\n\n"
+        "9️⃣ **Respeite a moderação**\n"
+        "A equipe de moderadores está aqui para organizar. Questione com respeito e siga as orientações.\n\n"
+        "🔟 **Tenha paciência**\n"
+        "Nem sempre sua dúvida será respondida na hora. Espere com calma e continue participando.\n\n"
+        "✅ Ao utilizar a comunidade, você declara que leu e concorda com os Termos de Uso da TradingClass."
+    )
+    embed = discord.Embed(title="📜 Regras da Comunidade TradingClass", description=rules_text, color=EMBED_COLOR)
+    await interaction.channel.send(embed=embed)
+    await interaction.response.send_message("Mensagem de regras enviada!", ephemeral=True)
+
 # Executar o bot
 if __name__ == "__main__":
-    if not DISCORD_TOKEN:
-        print("❌ Erro: DISCORD_TOKEN não encontrado")
-    else:
+    print("🚀 Iniciando Bot Discord Trading Class...")
+    print("=" * 50)
+    
+    # Validar variáveis de ambiente
+    if not validate_environment():
+        print("❌ Bot não pode ser iniciado. Configure as variáveis de ambiente no Railway.")
+        exit(1)
+    
+    # Mostrar configuração (sem senhas)
+    print(f"Discord Token: {'✅ Configurado' if DISCORD_TOKEN else '❌ Não configurado'}")
+    print(f"Guild ID: {GUILD_ID}")
+    print(f"Banco: {DB_CONFIG['host']}:{DB_CONFIG['port']}")
+    print(f"Database: {DB_CONFIG['database']}")
+    print(f"User: {DB_CONFIG['user']}")
+    print("=" * 50)
+    
+    try:
         client.run(DISCORD_TOKEN)
+    except Exception as e:
+        print(f"❌ Erro ao iniciar bot: {e}")
+        exit(1)
