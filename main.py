@@ -1,43 +1,264 @@
+#!/usr/bin/env python3
+"""
+Bot Discord com Acesso Direto ao Banco - Trading Class
+Versão alternativa que acessa o banco diretamente
+"""
+
 import discord
 from discord import app_commands, ui
 from discord.ext import tasks
 import os
-import requests
+import mysql.connector
+from datetime import datetime, timedelta
+import hashlib
+import secrets
 
-# --- CONFIGURAÇÃO ---
-# As configurações agora são carregadas da API no início
-API_BASE_URL = os.environ.get('API_BASE_URL') 
-API_KEY = os.environ.get('API_KEY')
+# Configuração do banco
+DB_CONFIG = {
+    'host': os.environ.get('DB_HOST', 'localhost'),
+    'user': os.environ.get('DB_USER', 'u757800983_tradingclass'),
+    'password': os.environ.get('DB_PASSWORD', 'sua_senha_aqui'),
+    'database': os.environ.get('DB_NAME', 'u757800983_tradingclass'),
+    'port': int(os.environ.get('DB_PORT', 3306))
+}
+
+# Configuração do bot
+DISCORD_TOKEN = os.environ.get('DISCORD_TOKEN')
 GUILD_ID = int(os.environ.get('GUILD_ID'))
-
-# IDs dos cargos serão carregados da API
 ROLE_ALUNO_ID = None
 ROLE_MENTORADO_ID = None
 
 REGISTRATION_LINK = "https://aluno.operebem.com.br"
 EMBED_COLOR = 0x5865F2
 
-# --- MODAL: O FORMULÁRIO POP-UP PARA O CÓDIGO ---
+def get_db_connection():
+    """Conectar ao banco de dados"""
+    try:
+        return mysql.connector.connect(**DB_CONFIG)
+    except Exception as e:
+        print(f"Erro ao conectar ao banco: {e}")
+        return None
+
+def validate_code(code):
+    """Validar código de validação"""
+    conn = get_db_connection()
+    if not conn:
+        return None
+    
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT 
+                dv.id, dv.user_id, dv.validation_code, dv.subscription_tier,
+                dv.purchase_date, dv.plan_end_date, dv.amount_paid, dv.payment_method,
+                dv.is_validated, dv.discord_user_id,
+                u.nome_completo, u.email, u.subscription_status, u.subscription_expires_at
+            FROM discord_validation dv
+            JOIN users u ON dv.user_id = u.id
+            WHERE dv.validation_code = %s AND u.status = 'active'
+        """, (code,))
+        
+        result = cursor.fetchone()
+        
+        if result:
+            # Verificar se a assinatura ainda está ativa
+            is_expired = False
+            if result['subscription_expires_at']:
+                expires_at = datetime.strptime(str(result['subscription_expires_at']), '%Y-%m-%d %H:%M:%S')
+                is_expired = datetime.now() > expires_at
+            
+            return {
+                'success': True,
+                'data': {
+                    'user_id': result['user_id'],
+                    'validation_code': result['validation_code'],
+                    'subscription_tier': result['subscription_tier'],
+                    'purchase_date': result['purchase_date'],
+                    'plan_end_date': result['plan_end_date'],
+                    'amount_paid': result['amount_paid'],
+                    'payment_method': result['payment_method'],
+                    'is_validated': bool(result['is_validated']),
+                    'discord_user_id': result['discord_user_id'],
+                    'nome_completo': result['nome_completo'],
+                    'email': result['email'],
+                    'subscription_status': result['subscription_status'],
+                    'subscription_expires_at': result['subscription_expires_at'],
+                    'is_expired': is_expired,
+                    'discord_role': result['subscription_tier']
+                }
+            }
+        else:
+            return {
+                'success': False,
+                'error': 'Código de validação inválido ou usuário inativo'
+            }
+    
+    except Exception as e:
+        print(f"Erro na validação: {e}")
+        return {
+            'success': False,
+            'error': 'Erro interno do servidor'
+        }
+    finally:
+        conn.close()
+
+def mark_as_validated(code, discord_user_id, bot_user_id=None):
+    """Marcar código como validado"""
+    conn = get_db_connection()
+    if not conn:
+        return False
+    
+    try:
+        cursor = conn.cursor()
+        
+        # Buscar dados do usuário
+        cursor.execute("""
+            SELECT dv.user_id, dv.subscription_tier, u.subscription_expires_at
+            FROM discord_validation dv
+            JOIN users u ON dv.user_id = u.id
+            WHERE dv.validation_code = %s
+        """, (code,))
+        
+        user = cursor.fetchone()
+        if not user:
+            return False
+        
+        user_id, subscription_tier, subscription_expires_at = user
+        
+        # Atualizar validação
+        cursor.execute("""
+            UPDATE discord_validation 
+            SET is_validated = 1, discord_user_id = %s, role_status = 'assigned', 
+                role_assigned_at = NOW(), last_role_check = NOW(), updated_at = NOW()
+            WHERE validation_code = %s
+        """, (discord_user_id, code))
+        
+        # Atualizar usuário
+        cursor.execute("""
+            UPDATE users 
+            SET discord_sync_status = 'synced', last_discord_sync = NOW()
+            WHERE id = %s
+        """, (user_id,))
+        
+        # Log da ação
+        cursor.execute("""
+            INSERT INTO discord_role_logs 
+            (discord_user_id, user_id, validation_code, action, role_name, subscription_tier, subscription_expires_at, bot_user_id, reason)
+            VALUES (%s, %s, %s, 'assign', %s, %s, %s, %s, 'Validação inicial do código')
+        """, (discord_user_id, user_id, code, subscription_tier, subscription_tier, subscription_expires_at, bot_user_id))
+        
+        conn.commit()
+        return True
+    
+    except Exception as e:
+        print(f"Erro ao marcar como validado: {e}")
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
+
+def get_expired_users():
+    """Buscar usuários com assinatura expirada"""
+    conn = get_db_connection()
+    if not conn:
+        return []
+    
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT 
+                dv.discord_user_id, dv.subscription_tier,
+                u.nome_completo, u.email, u.subscription_expires_at
+            FROM discord_validation dv
+            JOIN users u ON dv.user_id = u.id
+            WHERE u.status = 'active' 
+            AND u.subscription_status = 'active'
+            AND u.subscription_expires_at < NOW()
+            AND dv.discord_user_id IS NOT NULL
+            AND dv.is_validated = 1
+            ORDER BY u.subscription_expires_at ASC
+        """)
+        
+        return cursor.fetchall()
+    
+    except Exception as e:
+        print(f"Erro ao buscar usuários expirados: {e}")
+        return []
+    finally:
+        conn.close()
+
+def mark_role_removed(discord_user_id, bot_user_id=None):
+    """Marcar cargo como removido"""
+    conn = get_db_connection()
+    if not conn:
+        return False
+    
+    try:
+        cursor = conn.cursor()
+        
+        # Buscar dados do usuário
+        cursor.execute("""
+            SELECT dv.user_id, dv.validation_code, dv.subscription_tier, u.subscription_expires_at
+            FROM discord_validation dv
+            JOIN users u ON dv.user_id = u.id
+            WHERE dv.discord_user_id = %s AND dv.is_validated = 1
+        """, (discord_user_id,))
+        
+        user = cursor.fetchone()
+        if not user:
+            return False
+        
+        user_id, validation_code, subscription_tier, subscription_expires_at = user
+        
+        # Atualizar status do cargo
+        cursor.execute("""
+            UPDATE discord_validation 
+            SET role_status = 'expired', role_removed_at = NOW(), last_role_check = NOW(), updated_at = NOW()
+            WHERE discord_user_id = %s
+        """, (discord_user_id,))
+        
+        # Atualizar usuário
+        cursor.execute("""
+            UPDATE users 
+            SET discord_sync_status = 'pending', last_discord_sync = NOW()
+            WHERE id = %s
+        """, (user_id,))
+        
+        # Log da ação
+        cursor.execute("""
+            INSERT INTO discord_role_logs 
+            (discord_user_id, user_id, validation_code, action, role_name, subscription_tier, subscription_expires_at, bot_user_id, reason)
+            VALUES (%s, %s, %s, 'remove', %s, %s, %s, %s, 'Assinatura expirada - cargo removido automaticamente')
+        """, (discord_user_id, user_id, validation_code, subscription_tier, subscription_tier, subscription_expires_at, bot_user_id))
+        
+        conn.commit()
+        return True
+    
+    except Exception as e:
+        print(f"Erro ao marcar cargo como removido: {e}")
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
+
+# Modal para validação
 class ValidationModal(ui.Modal, title="Validação de Acesso"):
     token_input = ui.TextInput(label="Seu Token de Validação", placeholder="Cole aqui o token que você pegou no site...", style=discord.TextStyle.short)
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
         token = self.token_input.value.strip()
-        headers = {'X-API-Key': API_KEY}
         
         try:
-            params = {'action': 'validate', 'code': token}
-            response = requests.get(API_BASE_URL, params=params, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-
-            if not data.get('success'):
-                error_message = data.get('error', 'Token inválido ou já utilizado.')
+            # Validar código
+            result = validate_code(token)
+            
+            if not result or not result.get('success'):
+                error_message = result.get('error', 'Token inválido ou já utilizado.') if result else 'Erro interno do servidor'
                 await interaction.followup.send(f"❌ {error_message}", ephemeral=True)
                 return
 
-            user_data = data.get('data', {})
+            user_data = result.get('data', {})
             
             if user_data.get('is_expired'):
                 await interaction.followup.send("❌ Sua assinatura expirou. Por favor, renove para validar seu acesso.", ephemeral=True)
@@ -58,26 +279,28 @@ class ValidationModal(ui.Modal, title="Validação de Acesso"):
                 await interaction.followup.send(f"❌ Erro crítico: O cargo para '{tier}' não foi encontrado. Contate um administrador.", ephemeral=True)
                 return
             
+            # Remover outros cargos de assinatura
             roles_to_remove_ids = [ROLE_ALUNO_ID, ROLE_MENTORADO_ID]
             roles_to_remove = [role for role in member.roles if role.id in roles_to_remove_ids]
             if roles_to_remove:
                 await member.remove_roles(*roles_to_remove, reason="Ajuste de plano de assinatura")
 
+            # Adicionar cargo
             await member.add_roles(role_to_add, reason="Validação de assinatura via site")
 
-            post_data = {'code': token, 'discord_user_id': str(member.id), 'bot_user_id': str(client.user.id)}
-            requests.post(f"{API_BASE_URL}?action=mark_validated", json=post_data, headers=headers)
+            # Marcar como validado no banco
+            success = mark_as_validated(token, str(member.id), str(client.user.id))
+            
+            if success:
+                await interaction.followup.send(f"✅ Validação concluída! Você recebeu o cargo **{role_to_add.name}**. Bem-vindo(a)!", ephemeral=True)
+            else:
+                await interaction.followup.send("⚠️ Cargo adicionado, mas houve um erro ao atualizar o banco. Contate um administrador.", ephemeral=True)
 
-            await interaction.followup.send(f"✅ Validação concluída! Você recebeu o cargo **{role_to_add.name}**. Bem-vindo(a)!", ephemeral=True)
-
-        except requests.exceptions.RequestException as e:
-            print(f"Erro de API na validação: {e}")
-            await interaction.followup.send("❌ Ocorreu um erro ao comunicar com nosso sistema. Tente novamente mais tarde.", ephemeral=True)
         except Exception as e:
             print(f"Erro inesperado na validação: {e}")
             await interaction.followup.send("❌ Ocorreu um erro inesperado. Contate o suporte.", ephemeral=True)
 
-# --- VIEW: A CAIXA COM OS BOTÕES DE VALIDAÇÃO ---
+# View com botões
 class ValidationView(ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -90,7 +313,7 @@ class ValidationView(ui.View):
     async def register_button(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.send_message(f"Para se tornar um aluno, [clique aqui]({REGISTRATION_LINK}).", ephemeral=True)
 
-# --- CONEXÃO COM O BOT ---
+# Cliente do bot
 class MyClient(discord.Client):
     def __init__(self, *, intents: discord.Intents):
         super().__init__(intents=intents)
@@ -105,132 +328,92 @@ intents = discord.Intents.default()
 intents.members = True
 client = MyClient(intents=intents)
 
-# --- TAREFAS AGENDADAS ---
+# Tarefas automáticas
 @tasks.loop(hours=1)
 async def check_expired_subscriptions():
     print("Iniciando verificação de assinaturas expiradas...")
-    headers = {'X-API-Key': API_KEY}
     try:
-        params = {'action': 'get_expired_users'}
-        response = requests.get(API_BASE_URL, params=params, headers=headers)
-        response.raise_for_status()
-        data = response.json()
+        expired_users = get_expired_users()
+        print(f"Encontrados {len(expired_users)} usuários expirados.")
+        
+        guild = client.get_guild(GUILD_ID)
+        if not guild:
+            return
+        
+        for user in expired_users:
+            discord_id = user.get('discord_user_id')
+            tier = user.get('subscription_tier')
+            if not discord_id or not tier:
+                continue
 
-        if data.get('success'):
-            expired_users = data.get('expired_users', [])
-            print(f"Encontrados {len(expired_users)} usuários expirados.")
-            guild = client.get_guild(GUILD_ID)
-            if not guild: return
+            member = guild.get_member(int(discord_id))
+            role_id_to_remove = ROLE_ALUNO_ID if tier == 'Aluno' else ROLE_MENTORADO_ID
+            role_to_remove = guild.get_role(role_id_to_remove)
             
-            for user in expired_users:
-                discord_id = user.get('discord_user_id')
-                tier = user.get('subscription_tier')
-                if not discord_id or not tier: continue
-
-                member = guild.get_member(int(discord_id))
-                role_id_to_remove = ROLE_ALUNO_ID if tier == 'Aluno' else ROLE_MENTORADO_ID
-                role_to_remove = guild.get_role(role_id_to_remove)
+            if member and role_to_remove and role_to_remove in member.roles:
+                await member.remove_roles(role_to_remove, reason="Assinatura expirada")
                 
-                if member and role_to_remove and role_to_remove in member.roles:
-                    await member.remove_roles(role_to_remove, reason="Assinatura expirada")
-                    
-                    post_data = {'discord_user_id': str(discord_id), 'bot_user_id': str(client.user.id)}
-                    requests.post(f"{API_BASE_URL}?action=mark_role_removed", json=post_data, headers=headers)
+                # Marcar como removido no banco
+                mark_role_removed(discord_id, str(client.user.id))
 
-                    print(f"Cargo '{role_to_remove.name}' removido de {member.name}.")
-                    try:
-                        await member.send(f"Olá! Notamos que sua assinatura {tier} expirou. Seu cargo foi removido. Para renovar, visite: {REGISTRATION_LINK}")
-                    except discord.Forbidden:
-                        print(f"Não foi possível enviar DM para {member.name}.")
+                print(f"Cargo '{role_to_remove.name}' removido de {member.name}.")
+                try:
+                    await member.send(f"Olá! Notamos que sua assinatura {tier} expirou. Seu cargo foi removido. Para renovar, visite: {REGISTRATION_LINK}")
+                except discord.Forbidden:
+                    print(f"Não foi possível enviar DM para {member.name}.")
 
     except Exception as e:
         print(f"Erro na verificação de expirados: {e}")
 
-@tasks.loop(hours=6)
-async def sync_users():
-    print("Iniciando sincronização de usuários pendentes...")
-    headers = {'X-API-Key': API_KEY}
-    try:
-        params = {'action': 'get_sync_pending'}
-        response = requests.get(API_BASE_URL, params=params, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-
-        if data.get('success'):
-            pending_users = data.get('users', [])
-            print(f"Encontrados {len(pending_users)} usuários para sincronizar.")
-            guild = client.get_guild(GUILD_ID)
-            if not guild: return
-
-            for user in pending_users:
-                if user.get('subscription_status') != 'active': continue
-                
-                discord_id = user.get('discord_user_id')
-                tier = user.get('subscription_tier')
-                if not discord_id or not tier: continue
-
-                member = guild.get_member(int(discord_id))
-                role_id_to_add = ROLE_ALUNO_ID if tier == 'Aluno' else ROLE_MENTORADO_ID
-                role_to_add = guild.get_role(role_id_to_add)
-
-                if member and role_to_add and role_to_add not in member.roles:
-                    await member.add_roles(role_to_add, reason="Sincronização de assinatura ativa")
-                    print(f"Cargo '{role_to_add.name}' sincronizado para {member.name}.")
-
-    except Exception as e:
-        print(f"Erro na sincronização de usuários: {e}")
-
-# --- EVENTO DE BOT PRONTO ---
 @client.event
 async def on_ready():
     global ROLE_ALUNO_ID, ROLE_MENTORADO_ID
-    headers = {'X-API-Key': API_KEY}
-    print("Carregando configurações da API...")
-    try:
-        params_aluno = {'action': 'get_config', 'key': 'role_aluno_id'}
-        response_aluno = requests.get(API_BASE_URL, params=params_aluno, headers=headers).json()
-        if response_aluno.get('success'):
-            ROLE_ALUNO_ID = int(response_aluno['value'])
-            print(f"ID do cargo Aluno carregado: {ROLE_ALUNO_ID}")
-
-        params_mentorado = {'action': 'get_config', 'key': 'role_mentorado_id'}
-        response_mentorado = requests.get(API_BASE_URL, params=params_mentorado, headers=headers).json()
-        if response_mentorado.get('success'):
-            ROLE_MENTORADO_ID = int(response_mentorado['value'])
-            print(f"ID do cargo Mentorado carregado: {ROLE_MENTORADO_ID}")
-    except Exception as e:
-        print(f"ERRO CRÍTICO ao carregar IDs dos cargos da API: {e}")
-
+    
+    # Carregar IDs dos cargos (você pode configurar via variáveis de ambiente)
+    ROLE_ALUNO_ID = int(os.environ.get('ROLE_ALUNO_ID', 0)) or None
+    ROLE_MENTORADO_ID = int(os.environ.get('ROLE_MENTORADO_ID', 0)) or None
+    
     client.add_view(ValidationView())
     if not check_expired_subscriptions.is_running():
         check_expired_subscriptions.start()
-    if not sync_users.is_running():
-        sync_users.start()
         
     print(f'✅ Bot {client.user} está online e pronto!')
+    print(f'Cargo Aluno ID: {ROLE_ALUNO_ID}')
+    print(f'Cargo Mentorado ID: {ROLE_MENTORADO_ID}')
 
-# --- COMANDOS ADMINISTRATIVOS ---
-@client.tree.command(name="status", description="Verifica o status do sistema e da API.")
+# Comandos administrativos
+@client.tree.command(name="status", description="Verifica o status do sistema.")
 @app_commands.default_permissions(administrator=True)
 async def status(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    headers = {'X-API-Key': API_KEY}
+    
     embed = discord.Embed(title="📊 Status do Sistema de Integração", color=EMBED_COLOR)
     
     try:
-        response = requests.get(API_BASE_URL, params={'action':'list'}, headers=headers)
-        if response.status_code == 200:
-            embed.add_field(name="Conexão com a API", value="✅ Sucesso", inline=False)
+        # Testar conexão com banco
+        conn = get_db_connection()
+        if conn:
+            embed.add_field(name="Conexão com Banco", value="✅ Sucesso", inline=False)
             
-            expired_data = requests.get(API_BASE_URL, params={'action':'get_expired_users'}, headers=headers).json()
-            sync_data = requests.get(API_BASE_URL, params={'action':'get_sync_pending'}, headers=headers).json()
-
-            embed.add_field(name="Usuários Expirados", value=expired_data.get('total', 'N/A'), inline=True)
-            embed.add_field(name="Pendentes de Sincronização", value=sync_data.get('total', 'N/A'), inline=True)
+            # Contar usuários
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM users WHERE status = 'active'")
+            total_users = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM discord_validation WHERE is_validated = 1")
+            validated_users = cursor.fetchone()[0]
+            
+            expired_users = get_expired_users()
+            
+            embed.add_field(name="Usuários Ativos", value=str(total_users), inline=True)
+            embed.add_field(name="Usuários Validados", value=str(validated_users), inline=True)
+            embed.add_field(name="Usuários Expirados", value=str(len(expired_users)), inline=True)
+            
+            conn.close()
         else:
-            embed.add_field(name="Conexão com a API", value=f"❌ Falha (Código: {response.status_code})", inline=False)
+            embed.add_field(name="Conexão com Banco", value="❌ Falha", inline=False)
     except Exception as e:
-        embed.add_field(name="Conexão com a API", value=f"❌ Falha Grave: {e}", inline=False)
+        embed.add_field(name="Conexão com Banco", value=f"❌ Erro: {e}", inline=False)
 
     embed.add_field(name="ID Cargo Aluno", value=f"`{ROLE_ALUNO_ID}`" if ROLE_ALUNO_ID else "Não configurado", inline=False)
     embed.add_field(name="ID Cargo Mentorado", value=f"`{ROLE_MENTORADO_ID}`" if ROLE_MENTORADO_ID else "Não configurado", inline=False)
@@ -242,21 +425,12 @@ async def status(interaction: discord.Interaction):
 @app_commands.describe(aluno="O cargo para membros Alunos.", mentorado="O cargo para membros Mentorados.")
 async def configure_roles(interaction: discord.Interaction, aluno: discord.Role, mentorado: discord.Role):
     await interaction.response.defer(ephemeral=True)
-    headers = {'X-API-Key': API_KEY}
-    try:
-        post_data_aluno = {'key': 'role_aluno_id', 'value': str(aluno.id)}
-        requests.post(f"{API_BASE_URL}?action=update_config", json=post_data_aluno, headers=headers).raise_for_status()
+    
+    global ROLE_ALUNO_ID, ROLE_MENTORADO_ID
+    ROLE_ALUNO_ID = aluno.id
+    ROLE_MENTORADO_ID = mentorado.id
 
-        post_data_mentorado = {'key': 'role_mentorado_id', 'value': str(mentorado.id)}
-        requests.post(f"{API_BASE_URL}?action=update_config", json=post_data_mentorado, headers=headers).raise_for_status()
-
-        global ROLE_ALUNO_ID, ROLE_MENTORADO_ID
-        ROLE_ALUNO_ID = aluno.id
-        ROLE_MENTORADO_ID = mentorado.id
-
-        await interaction.followup.send("✅ IDs dos cargos configurados com sucesso na API e no bot!")
-    except Exception as e:
-        await interaction.followup.send(f"❌ Erro ao atualizar configuração na API: {e}")
+    await interaction.followup.send("✅ IDs dos cargos configurados com sucesso!")
 
 @client.tree.command(name="enviar_painel_validacao", description="Envia o painel de validação fixo neste canal.")
 @app_commands.default_permissions(administrator=True)
@@ -265,61 +439,9 @@ async def send_validation_panel(interaction: discord.Interaction):
     await interaction.channel.send(embed=embed, view=ValidationView())
     await interaction.response.send_message("Painel de validação enviado!", ephemeral=True)
 
-@client.tree.command(name="enviar_boas_vindas", description="Envia a mensagem de boas-vindas neste canal.")
-@app_commands.default_permissions(administrator=True)
-@app_commands.describe(canal_validacao="O canal para onde o botão de validação deve levar.")
-async def send_welcome_message(interaction: discord.Interaction, canal_validacao: discord.TextChannel):
-    welcome_text = (
-        "💎 **COMUNIDADE TRADINGCLASS**\n\n"
-        "Este é um espaço exclusivo da OpereBem para quem decidiu evoluir de verdade no mercado.\n"
-        "Aqui dentro você terá acesso a:\n\n"
-        ":books: Materiais e apostilas para estudo\n"
-        ":movie_camera: Aulas e treinamentos organizados por módulos\n"
-        ":bar_chart: Discussões e análises de mercado em tempo real\n"
-        ":busts_in_silhouette: Conexão com professores, traders e outros alunos\n\n"
-        f":arrow_right: Para liberar seu acesso, vá até {canal_validacao.mention} e siga as instruções.\n\n"
-        "Seu próximo passo como Trader começa agora. :rocket:"
-    )
-    embed = discord.Embed(description=welcome_text, color=EMBED_COLOR)
-    view = ui.View()
-    view.add_item(ui.Button(label="Ir para Validação", style=discord.ButtonStyle.link, url=canal_validacao.jump_url))
-    view.add_item(ui.Button(label="Ainda não sou aluno", style=discord.ButtonStyle.link, url=REGISTRATION_LINK))
-    await interaction.channel.send(embed=embed, view=view)
-    await interaction.response.send_message("Mensagem de boas-vindas enviada!", ephemeral=True)
-
-@client.tree.command(name="regras", description="Envia a mensagem com as regras da comunidade neste canal.")
-@app_commands.default_permissions(administrator=True)
-async def send_rules(interaction: discord.Interaction):
-    rules_text = (
-        "1️⃣ **Respeito em primeiro lugar**\n"
-        "Trate todos com cordialidade. Não será tolerado preconceito, ataques pessoais, xingamentos ou qualquer forma de discriminação.\n\n"
-        "2️⃣ **Sem spam**\n"
-        "Evite flood de mensagens, áudios ou imagens desnecessárias. Links externos só com autorização da moderação.\n\n"
-        "3️⃣ **Foco no aprendizado**\n"
-        "Essa comunidade é sobre trading, mercado financeiro e desenvolvimento. Mantenha os tópicos relevantes dentro de cada canal.\n\n"
-        "4️⃣ **Nada de calls ou sinais de trade**\n"
-        "O objetivo aqui é educacional. Não compartilhe calls de compra/venda ou promessas de ganhos fáceis.\n\n"
-        "5️⃣ **Ambiente saudável**\n"
-        "Não poste conteúdos ofensivos, violentos, políticos ou de cunho sexual.\n\n"
-        "6️⃣ **Ajuda mútua e colaboração**\n"
-        "Compartilhe conhecimento, tire dúvidas, incentive a evolução dos colegas. A comunidade cresce junto.\n\n"
-        "7️⃣ **Divulgação de terceiros**\n"
-        "Proibido divulgar cursos, canais ou serviços externos sem autorização da equipe.\n\n"
-        "8️⃣ **Confidencialidade**\n"
-        "Respeite o conteúdo exclusivo da TradingClass. Não compartilhe materiais pagos fora do servidor.\n\n"
-        "9️⃣ **Respeite a moderação**\n"
-        "A equipe de moderadores está aqui para organizar. Questione com respeito e siga as orientações.\n\n"
-        "🔟 **Tenha paciência**\n"
-        "Nem sempre sua dúvida será respondida na hora. Espere com calma e continue participando.\n\n"
-        "✅ Ao utilizar a comunidade, você declara que leu e concorda com os Termos de Uso da TradingClass."
-    )
-    embed = discord.Embed(title="📜 Regras da Comunidade TradingClass", description=rules_text, color=EMBED_COLOR)
-    await interaction.channel.send(embed=embed)
-    await interaction.response.send_message("Mensagem de regras enviada!", ephemeral=True)
-
-# --- RODAR O BOT ---
-bot_token = os.environ.get('DISCORD_TOKEN')
-if not bot_token or not API_BASE_URL or not API_KEY or not GUILD_ID:
-    print("❌ Erro crítico: Uma ou mais variáveis de ambiente (DISCORD_TOKEN, API_BASE_URL, API_KEY, GUILD_ID) não foram encontradas.")
-else:
-    client.run(bot_token)
+# Executar o bot
+if __name__ == "__main__":
+    if not DISCORD_TOKEN:
+        print("❌ Erro: DISCORD_TOKEN não encontrado")
+    else:
+        client.run(DISCORD_TOKEN)
