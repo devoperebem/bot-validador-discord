@@ -5,13 +5,12 @@ import mysql.connector
 from mysql.connector import Error
 
 # --- CONFIGURAÇÃO ---
+# MAPA DE CARGOS SIMPLIFICADO AQUI
 ROLE_MAP = {
-    'Prata': "Prata 🥈",
-    'Ouro': "Ouro 🥇",
-    'Diamante': "Diamante 💎"
+    'Aluno': 'Aluno',
+    'Mentorado': 'Mentorado'
 }
 REGISTRATION_LINK = "https://aluno.operebem.com.br"
-# Cor azul "Blurple" do Discord
 EMBED_COLOR = 0x5865F2 
 
 # --- MODAL: O FORMULÁRIO POP-UP PARA O CÓDIGO ---
@@ -19,8 +18,8 @@ class ValidationModal(ui.Modal, title="Validação de Acesso"):
     token_input = ui.TextInput(label="Seu Token de Validação", placeholder="Cole aqui o token que você pegou no site...", style=discord.TextStyle.short)
 
     async def on_submit(self, interaction: discord.Interaction):
+        # A lógica interna de validação permanece a mesma, agora usando o novo ROLE_MAP
         await interaction.response.defer(ephemeral=True, thinking=True)
-        # ... (Toda a lógica de validação do banco de dados permanece a mesma) ...
         token = self.token_input.value.strip()
         connection = create_db_connection()
 
@@ -45,7 +44,7 @@ class ValidationModal(ui.Modal, title="Validação de Acesso"):
             target_role_name = ROLE_MAP.get(target_tier)
 
             if not target_role_name:
-                await interaction.followup.send("❌ Erro: Seu plano não corresponde a um cargo válido. Contate o suporte.", ephemeral=True)
+                await interaction.followup.send(f"❌ Erro: Seu plano '{target_tier}' não corresponde a um cargo válido. Contate o suporte.", ephemeral=True)
                 return
 
             guild = interaction.guild
@@ -58,7 +57,7 @@ class ValidationModal(ui.Modal, title="Validação de Acesso"):
 
             roles_to_remove = [role for role in member.roles if role.name in ROLE_MAP.values() and role.name != target_role_name]
             if roles_to_remove:
-                await member.remove_roles(*roles_to_remove, reason="Upgrade de plano de assinatura")
+                await member.remove_roles(*roles_to_remove, reason="Upgrade ou ajuste de plano")
 
             await member.add_roles(role_to_add, reason="Validação de assinatura via site")
 
@@ -73,6 +72,7 @@ class ValidationModal(ui.Modal, title="Validação de Acesso"):
         finally:
             cursor.close()
             connection.close()
+
 
 # --- VIEW: A CAIXA COM OS BOTÕES DE VALIDAÇÃO ---
 class ValidationView(ui.View):
@@ -126,18 +126,19 @@ async def send_validation_panel(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🔑 Área Exclusiva para Alunos TradingClass",
         description="Para acessar os canais e benefícios exclusivos, é necessário validar seu cadastro.\n\nClique no botão abaixo para inserir seu TOKEN único (disponível na área do aluno) e liberar automaticamente seu cargo:",
-        color=EMBED_COLOR # <-- COR ALTERADA AQUI
+        color=EMBED_COLOR
     )
     await interaction.channel.send(embed=embed, view=ValidationView())
     await interaction.response.send_message("Painel de validação enviado!", ephemeral=True)
 
-# --- NOVO COMANDO DE BOAS-VINDAS ---
+# --- COMANDO DE BOAS-VINDAS ---
 @tree.command(name="enviar_boas_vindas", description="Envia a mensagem de boas-vindas neste canal.")
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(canal_validacao="O canal para onde o botão de validação deve levar.")
 async def send_welcome_message(interaction: discord.Interaction, canal_validacao: discord.TextChannel):
     welcome_text = (
-        ":wave: **Bem-vindo à TradingClass!**\n\n"
+        # BEM-VINDO ALTERADO AQUI
+        "💎 **COMUNIDADE TRADINGCLASS**\n\n"
         "Este é um espaço exclusivo da OpereBem para quem decidiu evoluir de verdade no mercado.\n"
         "Aqui dentro você terá acesso a:\n\n"
         ":books: Materiais e apostilas para estudo\n"
@@ -153,13 +154,49 @@ async def send_welcome_message(interaction: discord.Interaction, canal_validacao
         color=EMBED_COLOR
     )
 
-    # Criando os botões para a mensagem de boas-vindas
     view = ui.View()
     view.add_item(ui.Button(label="Ir para Validação", style=discord.ButtonStyle.link, url=canal_validacao.jump_url))
     view.add_item(ui.Button(label="Ainda não sou aluno", style=discord.ButtonStyle.link, url=REGISTRATION_LINK))
 
     await interaction.channel.send(embed=embed, view=view)
     await interaction.response.send_message("Mensagem de boas-vindas enviada!", ephemeral=True)
+
+# --- NOVO COMANDO DE REGRAS ---
+@tree.command(name="regras", description="Envia a mensagem com as regras da comunidade neste canal.")
+@app_commands.default_permissions(administrator=True)
+async def send_rules(interaction: discord.Interaction):
+    rules_text = (
+        "1️⃣ **Respeito em primeiro lugar**\n"
+        "Trate todos com cordialidade. Não será tolerado preconceito, ataques pessoais, xingamentos ou qualquer forma de discriminação.\n\n"
+        "2️⃣ **Sem spam**\n"
+        "Evite flood de mensagens, áudios ou imagens desnecessárias. Links externos só com autorização da moderação.\n\n"
+        "3️⃣ **Foco no aprendizado**\n"
+        "Essa comunidade é sobre trading, mercado financeiro e desenvolvimento. Mantenha os tópicos relevantes dentro de cada canal.\n\n"
+        "4️⃣ **Nada de calls ou sinais de trade**\n"
+        "O objetivo aqui é educacional. Não compartilhe calls de compra/venda ou promessas de ganhos fáceis.\n\n"
+        "5️⃣ **Ambiente saudável**\n"
+        "Não poste conteúdos ofensivos, violentos, políticos ou de cunho sexual.\n\n"
+        "6️⃣ **Ajuda mútua e colaboração**\n"
+        "Compartilhe conhecimento, tire dúvidas, incentive a evolução dos colegas. A comunidade cresce junto.\n\n"
+        "7️⃣ **Divulgação de terceiros**\n"
+        "Proibido divulgar cursos, canais ou serviços externos sem autorização da equipe.\n\n"
+        "8️⃣ **Confidencialidade**\n"
+        "Respeite o conteúdo exclusivo da TradingClass. Não compartilhe materiais pagos fora do servidor.\n\n"
+        "9️⃣ **Respeite a moderação**\n"
+        "A equipe de moderadores está aqui para organizar. Questione com respeito e siga as orientações.\n\n"
+        "🔟 **Tenha paciência**\n"
+        "Nem sempre sua dúvida será respondida na hora. Espere com calma e continue participando.\n\n"
+        "✅ Ao utilizar a comunidade, você declara que leu e concorda com os Termos de Uso da TradingClass."
+    )
+
+    embed = discord.Embed(
+        title="📜 Regras da Comunidade TradingClass",
+        description=rules_text,
+        color=EMBED_COLOR
+    )
+
+    await interaction.channel.send(embed=embed)
+    await interaction.response.send_message("Mensagem de regras enviada!", ephemeral=True)
 
 # --- RODAR O BOT ---
 bot_token = os.environ.get('DISCORD_TOKEN')
